@@ -1,0 +1,34 @@
+=====================================================================
+  Elfie wake word — run this ON WINDOWS (not inside WSL)
+  WSL has no microphone, so the part that hears "Hey Jarvis" lives here.
+=====================================================================
+
+ONE-TIME SETUP
+--------------
+1. Open a Windows terminal (PowerShell or Command Prompt).
+2. Go to this folder:
+       cd C:\Users\zilan\tools\elfie-ai\windows
+3. Install the listener's dependencies (once):
+       setup.bat
+   (this installs openwakeword, sounddevice, numpy, onnxruntime)
+
+EVERY TIME YOU WANT HANDS-FREE WAKE
+-----------------------------------
+4. Make sure Elfie is running in WSL (it is, via systemd) and the
+   dashboard tab is open:  http://localhost:8765   (set to Wake-word mode)
+5. Start listening:
+       python wake_listener.py
+6. Say "Hey Jarvis"  ->  the open tab connects and Elfie greets you.
+   Stop talking -> she hangs up -> say "Hey Jarvis" again to resume.
+
+NOTES
+-----
+- Keep the dashboard tab open; it's what connects when you say the word.
+- Change the phrase / sensitivity in the dashboard: Settings -> Wake word.
+- To get "Hey ELFIE" instead of "Hey Jarvis": train hey_elfie.onnx with the
+  free Colab (see the wake-word report in your dashboard), drop the .onnx
+  file in this folder, pick "Hey Elfie" in Settings, restart this script.
+- To start it automatically at Windows login:
+       Win+R  ->  shell:startup  ->  put a shortcut to:
+       pythonw.exe C:\Users\zilan\tools\elfie-ai\windows\wake_listener.py
+=====================================================================

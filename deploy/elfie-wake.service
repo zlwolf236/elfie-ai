@@ -1,0 +1,16 @@
+[Unit]
+# Template — install_services.sh fills in the __ELFIE_*__ placeholders.
+# WSL-side wake-word listener (uses the WSLg mic bridge via PulseAudio).
+Description=Elfie wake-word listener (WSL)
+After=network-online.target
+
+[Service]
+Environment=PATH=__ELFIE_PATH__
+Environment=PULSE_SERVER=unix:/mnt/wslg/PulseServer
+WorkingDirectory=__ELFIE_DIR__
+ExecStart=__ELFIE_DIR__/.venv/bin/python -m elfie.wake_service
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

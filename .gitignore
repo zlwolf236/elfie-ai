@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+data/
+*.log
+.DS_Store
+
+# downloaded on setup (deploy/fetch_models.sh)
+models/vosk-small/

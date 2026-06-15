@@ -1,0 +1,15 @@
+[Unit]
+# Template — install_services.sh fills in the __ELFIE_*__ placeholders for
+# your machine. Don't edit this copy directly; run the installer.
+Description=Elfie dashboard (reports, tasks, talk page)
+After=network-online.target
+
+[Service]
+Environment=PATH=__ELFIE_PATH__
+WorkingDirectory=__ELFIE_DIR__
+ExecStart=__ELFIE_DIR__/.venv/bin/python -m elfie.dashboard
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

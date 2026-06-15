@@ -1,0 +1,17 @@
+app = "elfie-ai"
+primary_region = "sjc"
+
+[build]
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512
+
+# Keep one machine always running so Elfie answers instantly.
+# Remove this if you want to scale-to-zero (saves ~$2/month, adds cold-start delay).
+[http_service]
+  min_machines_running = 1

@@ -1,0 +1,13 @@
+# Local LiveKit server config — used when running dev mode with Docker.
+# For production use LiveKit Cloud instead (no config file needed).
+port: 7880
+rtc:
+  port_range_start: 50000
+  port_range_end: 50100
+  tcp_port: 7881            # ICE over TCP — needed for Windows browser -> WSL2 (localhost forwards TCP only)
+  node_ip: 127.0.0.1        # advertise localhost, not the Docker-internal IP
+  use_external_ip: false
+keys:
+  devkey: secret
+logging:
+  level: info
