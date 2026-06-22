@@ -23,6 +23,20 @@ logger = logging.getLogger("elfie.tools")
 
 NOTES_FILE = Path(__file__).parent.parent / "data" / "notes.json"
 REMINDERS_FILE = Path(__file__).parent.parent / "data" / "reminders.json"
+TOOL_USAGE_FILE = Path(__file__).parent.parent / "data" / "tool_usage.jsonl"
+
+
+def record_use(tool: str) -> None:
+    """Append a one-line tool-usage event so the dashboard can light up a tile.
+
+    Best-effort and silent: a logging failure must never break the actual tool.
+    """
+    try:
+        TOOL_USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with TOOL_USAGE_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"tool": tool, "ts": datetime.now(timezone.utc).isoformat()}) + "\n")
+    except Exception:
+        pass
 
 
 def _read_json(path: Path) -> dict:
@@ -48,6 +62,7 @@ class ElfieTools:
     @function_tool
     async def get_current_time(self, context: RunContext) -> str:
         """Returns the current local date and time. Call when the user asks what time or day it is."""
+        record_use("get_current_time")
         return datetime.now().strftime("%A, %B %d at %I:%M %p")
 
     @function_tool
@@ -56,6 +71,7 @@ class ElfieTools:
         Searches the web for current information.
         Call for: weather, news, sports scores, prices, facts, anything time-sensitive.
         """
+        record_use("search_web")
         try:
             async with httpx.AsyncClient(timeout=8.0) as client:
                 r = await client.get(
@@ -82,6 +98,7 @@ class ElfieTools:
         Saves a note for the user.
         Call when the user says 'remember', 'note that', 'write this down', or similar.
         """
+        record_use("take_note")
         try:
             data = _read_json(NOTES_FILE)
             notes = data.get("notes", [])
@@ -102,6 +119,7 @@ class ElfieTools:
         Reads back saved notes.
         Call when the user asks what they noted, or to recall something they asked Elfie to remember.
         """
+        record_use("read_notes")
         data = _read_json(NOTES_FILE)
         notes = data.get("notes", [])
         if not notes:
@@ -119,6 +137,7 @@ class ElfieTools:
         The result arrives later as a report — tell the user it's started and that
         you'll announce when it's done. Don't wait for it.
         """
+        record_use("delegate_task")
         from elfie.delegate import MANAGER
         if not CONFIG.delegate.enabled:
             return "Delegation is disabled in config."
@@ -136,6 +155,7 @@ class ElfieTools:
         give the user a one-sentence plain version out loud, and put the depth here.
         The 'request' param should fully describe what the report must cover.
         """
+        record_use("write_report")
         from elfie.delegate import MANAGER
         task = MANAGER.start(request, kind="report", title=title)
         return (
@@ -152,6 +172,7 @@ class ElfieTools:
         Call when the user says 'expand on that', 'continue that work',
         'add to it', or asks for changes to something a task already produced.
         """
+        record_use("continue_task")
         from elfie.delegate import MANAGER
         prior = next(
             (t for t in MANAGER.list_tasks(20)
@@ -182,6 +203,7 @@ class ElfieTools:
         'learn to...', 'can you add the ability to...', 'I wish you could...'.
         short_name: snake_case, e.g. 'crypto_price' or 'weather_forecast'.
         """
+        record_use("learn_skill")
         from elfie.delegate import MANAGER
         task = MANAGER.start(
             what_it_should_do,
@@ -203,6 +225,7 @@ class ElfieTools:
         email, or whether anything important came in.
         Returns the unread count and latest senders/subjects to summarize aloud.
         """
+        record_use("check_email")
         if not CONFIG.gmail_address or not CONFIG.gmail_app_password:
             return (
                 "Gmail isn't set up yet. Tell the user: create an app password at "
@@ -234,6 +257,7 @@ class ElfieTools:
         Convert spoken forms to a real domain: 'google dot com' -> 'google.com'.
         For bare site names, use the obvious domain ('youtube' -> 'youtube.com').
         """
+        record_use("open_website")
         from elfie import notify
         url = url.strip().replace(" ", "")
         if not url.startswith(("http://", "https://")):
@@ -248,6 +272,7 @@ class ElfieTools:
         Call when the user says 'show me', 'open it', 'bring it up', 'put it on
         my screen', or asks to see a report.
         """
+        record_use("show_report")
         from elfie import notify, reports
         items = reports.list_reports(limit=1)
         if not items:
@@ -264,6 +289,7 @@ class ElfieTools:
         Lists recent background tasks and their status.
         Call when the user asks how a delegated task or report is going.
         """
+        record_use("check_tasks")
         from elfie.delegate import MANAGER
         tasks = MANAGER.list_tasks(limit=5)
         if not tasks:
@@ -283,6 +309,7 @@ class ElfieTools:
         Call when the user says 'remind me to', 'don't let me forget', or similar.
         The 'when' param is a natural-language time like 'in 30 minutes' or 'at 3pm'.
         """
+        record_use("set_reminder")
         try:
             data = _read_json(REMINDERS_FILE)
             reminders = data.get("reminders", [])

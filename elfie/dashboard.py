@@ -1,9 +1,13 @@
 """
-Elfie dashboard — where you read what's too long to hear.
+Elfie dashboard — where you read what's too long to hear, and watch her think.
 
 A small local web page (no extra dependencies, stdlib only) showing:
+  - Home     — reactive voice orb + Mission Control capability grid + progress
+  - Skills   — the skill tree: what she can do, unlocked vs not yet learned
   - Reports  — everything Elfie wrote down instead of reading aloud
   - Tasks    — delegated background jobs and their status (auto-refreshes)
+  - Activity — session costs and transcripts
+  - Settings — voice, brain, wake word, conversation tuning
 
 Run alongside the agent:
     python -m elfie.dashboard          # http://localhost:8765
@@ -15,16 +19,125 @@ Routes:
     /api/reports       report index (JSON)
     /api/report/<id>   one report: {meta, content}
     /api/tasks         delegated task list (JSON)
+    /api/capabilities  tools + learned skills, with last-used timestamps (JSON)
+    /api/progress      headline counters: reports, tasks, skills, spend (JSON)
     /api/token         LiveKit join token for the /talk page
 """
 import json
 import logging
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from elfie import reports
 from elfie.config import CONFIG
 
 logger = logging.getLogger("elfie.dashboard")
+
+ELFIE_DIR = Path(__file__).parent
+DATA_DIR = ELFIE_DIR.parent / "data"
+SKILLS_DIR = ELFIE_DIR / "skills"
+TOOL_USAGE_FILE = DATA_DIR / "tool_usage.jsonl"
+
+# The built-in tools, grouped, with the tool-call names that "light up" each
+# tile. Keep in sync with elfie/tools.py — this is the human-facing catalogue.
+CAPABILITIES = [
+    # Conversation & knowledge
+    {"key": "search_web",    "name": "Search the web",     "desc": "weather, news, prices, facts", "icon": "🔎", "group": "Conversation & knowledge", "ids": ["search_web"]},
+    {"key": "time",          "name": "Time & date",        "desc": "what time / day is it",        "icon": "🕐", "group": "Conversation & knowledge", "ids": ["get_current_time"]},
+    {"key": "notes",         "name": "Notes",              "desc": "remember & recall things",     "icon": "📝", "group": "Conversation & knowledge", "ids": ["take_note", "read_notes"]},
+    {"key": "reminders",     "name": "Reminders",          "desc": "don't let me forget…",         "icon": "⏰", "group": "Conversation & knowledge", "ids": ["set_reminder"]},
+    # Deep work
+    {"key": "delegate_task", "name": "Delegate a task",    "desc": "Claude Code does real work",    "icon": "🤖", "group": "Deep work", "ids": ["delegate_task"]},
+    {"key": "write_report",  "name": "Write a report",     "desc": "depth goes to the dashboard",   "icon": "📄", "group": "Deep work", "ids": ["write_report"]},
+    {"key": "continue_task", "name": "Continue a task",    "desc": "same agent, full memory",       "icon": "↳",  "group": "Deep work", "ids": ["continue_task"]},
+    {"key": "learn_skill",   "name": "Learn a new skill",  "desc": "writes + safety-checks tools",  "icon": "✨", "group": "Deep work", "ids": ["learn_skill"]},
+    # Outside world
+    {"key": "check_email",   "name": "Check email",        "desc": "unread Gmail summary",          "icon": "📧", "group": "The outside world", "ids": ["check_email"]},
+    {"key": "open_website",  "name": "Open a website",     "desc": "open github for me",            "icon": "🌐", "group": "The outside world", "ids": ["open_website"]},
+    {"key": "show_report",   "name": "Show a report",      "desc": "pops it onto your screen",       "icon": "🖥️", "group": "The outside world", "ids": ["show_report"]},
+    {"key": "check_tasks",   "name": "Check task status",  "desc": "how's that job going",          "icon": "📋", "group": "The outside world", "ids": ["check_tasks"]},
+]
+
+# Aspirational nodes shown locked in the skill tree — they map to the
+# "Next things to work on" roadmap and hint at what learn_skill could add.
+LOCKED_NODES = [
+    {"key": "calendar", "name": "Calendar",     "icon": "📅"},
+    {"key": "home",     "name": "Home control", "icon": "🏠"},
+    {"key": "music",    "name": "Music",        "icon": "🎵"},
+]
+
+
+def _tool_last_used() -> dict:
+    """Map of tool-name -> latest ISO timestamp it was called, from the usage log."""
+    out: dict = {}
+    try:
+        for line in TOOL_USAGE_FILE.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                d = json.loads(line)
+                out[d["tool"]] = d["ts"]
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"Tool-usage read failed: {e}")
+    return out
+
+
+def _learned_skills() -> list:
+    """Skill files installed by learn_skill, newest mtime first."""
+    if not SKILLS_DIR.exists():
+        return []
+    out = []
+    for p in sorted(SKILLS_DIR.glob("*.py")):
+        if p.stem == "__init__":
+            continue
+        out.append({"key": p.stem, "name": p.stem.replace("_", " ").title(), "mtime": p.stat().st_mtime})
+    return out
+
+
+def _capabilities() -> list:
+    """Full capability catalogue for the grid + skill tree: built-ins, learned, locked."""
+    last = _tool_last_used()
+    caps = []
+    for c in CAPABILITIES:
+        lu = max((last[i] for i in c["ids"] if i in last), default=None)
+        caps.append({**c, "last_used": lu, "learned": False, "locked": False, "is_new": False})
+    now = time.time()
+    for s in _learned_skills():
+        caps.append({
+            "key": s["key"], "name": s["name"], "desc": "learned skill", "icon": "✨",
+            "group": "Learned skills", "ids": [s["key"]], "last_used": last.get(s["key"]),
+            "learned": True, "locked": False, "is_new": (now - s["mtime"]) < 86400,
+        })
+    for n in LOCKED_NODES:
+        caps.append({
+            "key": n["key"], "name": n["name"], "desc": "not yet learned", "icon": n["icon"],
+            "group": "Locked", "ids": [], "last_used": None, "learned": False, "locked": True, "is_new": False,
+        })
+    return caps
+
+
+def _progress_summary() -> dict:
+    """Headline counters for the Home stat row."""
+    from elfie.delegate import _read_tasks
+    try:
+        tasks = _read_tasks()
+    except Exception:
+        tasks = []
+    usage = _usage_summary()
+    learned = _learned_skills()
+    return {
+        "reports": len(reports.list_reports()),
+        "tasks_done": sum(1 for t in tasks if t.get("status") == "done"),
+        "tasks_total": len(tasks),
+        "skills_learned": len(learned),
+        "skills_total": len(CAPABILITIES) + len(learned) + len(LOCKED_NODES),
+        "skills_unlocked": len(CAPABILITIES) + len(learned),
+        "spent_today": usage["today_usd"],
+        "spent_total": usage["total_usd"],
+        "deepgram_balance": usage["deepgram_balance_usd"],
+    }
+
 
 PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -39,17 +152,21 @@ PAGE = """<!DOCTYPE html>
 <script src="https://cdn.jsdelivr.net/npm/livekit-client@2/dist/livekit-client.umd.min.js"></script>
 <style>
   :root {
-    --bg: #0f1117; --panel: #181b24; --border: #2a2f3d;
+    --bg: #0f1117; --panel: #181b24; --panel2: #1d212c; --border: #2a2f3d;
     --text: #e8eaf0; --dim: #8b93a7; --accent: #7aa2f7; --green: #9ece6a;
-    --red: #f7768e; --yellow: #e0af68;
+    --red: #f7768e; --yellow: #e0af68; --violet: #bb9af7;
   }
-  * { box-sizing: border-box; margin: 0; }
+  * { box-sizing: border-box; margin: 0; min-width: 0; }
   body {
-    background: var(--bg); color: var(--text);
+    background:
+      radial-gradient(1100px 560px at 12% -12%, #16203a 0%, transparent 55%),
+      radial-gradient(820px 460px at 112% 6%, #221a33 0%, transparent 50%),
+      var(--bg);
+    color: var(--text);
     font: 17px/1.65 -apple-system, 'Segoe UI', Roboto, sans-serif;
-    max-width: 860px; margin: 0 auto; padding: 24px 20px 60px;
+    max-width: 880px; margin: 0 auto; padding: 22px 20px 70px;
   }
-  header { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
   header h1 { font-size: 26px; }
   #status { color: var(--dim); font-size: 15px; }
   #status.live { color: var(--green); }
@@ -59,18 +176,52 @@ PAGE = """<!DOCTYPE html>
     color: var(--text); font-size: 16px; font-weight: 600; cursor: pointer;
   }
   #connect.live { border-color: var(--red); }
-  /* voice panel */
+
+  /* ── Reactive orb ─────────────────────────────────────────── */
+  #orb-stage {
+    position: relative; height: 178px; display: grid; place-items: center;
+    margin: 4px 0 14px;
+  }
+  #orb-wrap { position: relative; width: 170px; height: 170px; display: grid; place-items: center; }
+  .ring {
+    position: absolute; border-radius: 50%; border: 1.5px solid rgba(122,162,247,.45);
+    inset: 50% auto auto 50%; translate: -50% -50%; opacity: 0;
+  }
+  #orb-wrap.active .ring.r1 { animation: expand 2.6s ease-out infinite; }
+  #orb-wrap.active .ring.r2 { animation: expand 2.6s ease-out infinite .85s; }
+  #orb-wrap.active .ring.r3 { animation: expand 2.6s ease-out infinite 1.7s; }
+  @keyframes expand { 0%{width:62px;height:62px;opacity:.85} 100%{width:168px;height:168px;opacity:0} }
+  #orb {
+    width: 70px; height: 70px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #acc3ff, var(--accent) 46%, #34509f 100%);
+    box-shadow: 0 0 30px rgba(122,162,247,.6), inset 0 0 16px rgba(255,255,255,.35);
+    display: grid; place-items: center; font-size: 30px; z-index: 2;
+    transition: transform .08s linear, box-shadow .25s, background .4s;
+    animation: breathe 3.6s ease-in-out infinite;
+  }
+  @keyframes breathe { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
+  #orb-wrap.speaking #orb { animation: none; background: radial-gradient(circle at 35% 30%, #c8f0a8, var(--green) 46%, #4a7a32 100%); box-shadow: 0 0 36px rgba(158,206,106,.6), inset 0 0 16px rgba(255,255,255,.4); }
+  #orb-wrap.listening #orb { animation: none; box-shadow: 0 0 40px rgba(122,162,247,.85), inset 0 0 16px rgba(255,255,255,.45); }
+  #orb-wrap.thinking #orb { background: radial-gradient(circle at 35% 30%, #e6cffb, var(--violet) 46%, #5a3f8f 100%); animation: breathe 1.1s ease-in-out infinite; }
+  #orb-wrap.idle #orb { filter: saturate(.5) brightness(.8); box-shadow: 0 0 14px rgba(122,162,247,.25), inset 0 0 14px rgba(255,255,255,.2); }
+  .wave { position: absolute; bottom: -4px; display: flex; gap: 3px; align-items: flex-end; height: 28px; opacity: 0; transition: opacity .25s; }
+  #orb-wrap.speaking .wave, #orb-wrap.listening .wave { opacity: .9; }
+  .wave i { width: 3px; height: 5px; background: var(--accent); border-radius: 2px; transition: height .07s linear; }
+  #orb-wrap.speaking .wave i { background: var(--green); }
+  #orb-label { position: absolute; bottom: 2px; font-size: 13px; color: var(--dim); letter-spacing: .3px; }
+
+  /* voice chat */
   #chat {
-    height: 300px; overflow-y: auto; background: var(--panel);
+    height: 220px; overflow-y: auto; background: var(--panel);
     border: 1px solid var(--border); border-radius: 12px;
     padding: 16px; margin-bottom: 10px;
   }
-  #chat .hint { color: var(--dim); text-align: center; padding: 40px 0 0; }
+  #chat .hint { color: var(--dim); text-align: center; padding: 28px 0 0; }
   .msg { margin-bottom: 12px; }
   .msg .who { font-size: 13px; color: var(--dim); margin-bottom: 2px; }
   .msg.you .body { color: var(--accent); }
   .msg .body a { color: var(--green); }
-  #composer { display: flex; gap: 8px; margin-bottom: 26px; }
+  #composer { display: flex; gap: 8px; margin-bottom: 24px; }
   #input {
     flex: 1; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--border);
     background: var(--panel); color: var(--text); font-size: 16px;
@@ -79,11 +230,12 @@ PAGE = """<!DOCTYPE html>
     padding: 12px 22px; border-radius: 10px; border: 1px solid var(--border);
     background: var(--panel); color: var(--text); font-size: 16px; cursor: pointer;
   }
-  /* lists */
-  .tabs { display: flex; gap: 8px; margin-bottom: 18px; }
+
+  /* tabs + lists */
+  .tabs { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
   .tab {
-    padding: 8px 18px; border-radius: 9px; border: 1px solid var(--border);
-    background: var(--panel); color: var(--dim); cursor: pointer; font-size: 16px;
+    padding: 8px 16px; border-radius: 9px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--dim); cursor: pointer; font-size: 15px;
   }
   .tab.active { color: var(--text); border-color: var(--accent); }
   .card {
@@ -101,6 +253,59 @@ PAGE = """<!DOCTYPE html>
   .badge.running { background: #2e2a1e; color: var(--yellow); }
   .badge.failed, .badge.timeout { background: #2e1e22; color: var(--red); }
   .empty { color: var(--dim); padding: 40px 0; text-align: center; font-size: 16px; }
+
+  /* ── Mission Control capability grid ──────────────────────── */
+  .group-label { color: var(--violet); font-size: 12px; letter-spacing: 1.5px; text-transform: uppercase; margin: 18px 0 9px; }
+  .group-label:first-child { margin-top: 4px; }
+  .cap-grid { display: grid; gap: 11px; grid-template-columns: repeat(auto-fill, minmax(min(210px,100%),1fr)); }
+  .cap {
+    background: linear-gradient(180deg, var(--panel) 0%, #15181f 100%);
+    border: 1px solid var(--border); border-radius: 13px; padding: 13px 15px;
+    display: flex; gap: 11px; align-items: flex-start; position: relative; overflow: hidden;
+    transition: border-color .3s, box-shadow .3s;
+  }
+  .cap .ico { font-size: 20px; line-height: 1.3; }
+  .cap .name { font-weight: 650; font-size: 15px; }
+  .cap .desc { color: var(--dim); font-size: 12.5px; margin-top: 1px; }
+  .cap.on { border-color: var(--accent); box-shadow: 0 0 18px -6px var(--accent) inset; }
+  .cap.on .dot { position: absolute; top: 12px; right: 12px; width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 0 rgba(158,206,106,.6); animation: ping 2.2s ease-out infinite; }
+  .cap.fresh { animation: flash 1.4s ease-out; }
+  @keyframes ping { 0%{box-shadow:0 0 0 0 rgba(158,206,106,.5)} 70%{box-shadow:0 0 0 9px rgba(158,206,106,0)} 100%{box-shadow:0 0 0 0 rgba(158,206,106,0)} }
+  @keyframes flash { 0%{box-shadow:0 0 0 2px var(--green) inset} 100%{box-shadow:0 0 18px -6px var(--accent) inset} }
+  .cap.learned { border-color: #3a4a2e; }
+  .cap.locked { opacity: .45; }
+
+  /* progress stats */
+  .stats { display: grid; gap: 11px; grid-template-columns: repeat(auto-fit, minmax(min(150px,100%),1fr)); margin: 4px 0 12px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .stat .n { font-size: 28px; font-weight: 750; font-variant-numeric: tabular-nums; }
+  .stat .n.accent { color: var(--accent); } .stat .n.green { color: var(--green); } .stat .n.violet { color: var(--violet); }
+  .stat .l { color: var(--dim); font-size: 13px; margin-top: 2px; }
+  .bar { height: 7px; border-radius: 999px; background: #11141b; overflow: hidden; margin-top: 9px; }
+  .bar > i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--violet)); animation: fill 1.4s cubic-bezier(.2,.7,.2,1) both; }
+  @keyframes fill { from { width: 0 !important; } }
+
+  /* ── Skill tree ───────────────────────────────────────────── */
+  .tree-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .tree-head .lvl { font-size: 20px; font-weight: 750; color: var(--violet); }
+  .xp-bar { flex: 1; min-width: 140px; height: 8px; border-radius: 999px; background: #11141b; overflow: hidden; }
+  .xp-bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--violet), var(--accent)); animation: fill 1.6s both; }
+  .tier-label { color: var(--dim); font-size: 12px; letter-spacing: 1.5px; text-transform: uppercase; margin: 16px 0 9px; }
+  .tier { display: flex; flex-wrap: wrap; gap: 12px; }
+  .tnode {
+    display: grid; place-items: center; width: 76px; height: 76px; border-radius: 16px;
+    background: #11151e; border: 1px solid var(--border); position: relative; text-align: center;
+    padding: 6px; gap: 2px;
+  }
+  .tnode .e { font-size: 24px; }
+  .tnode .nm { font-size: 10.5px; color: var(--dim); line-height: 1.1; }
+  .tnode.unlocked { border-color: var(--green); box-shadow: 0 0 14px -5px var(--green); }
+  .tnode.unlocked .nm { color: var(--text); }
+  .tnode.locked { opacity: .4; filter: grayscale(1); }
+  .tnode.newnode { border-color: var(--violet); animation: pop 2.4s ease-in-out infinite; }
+  .tnode.newnode::after { content: 'NEW'; position: absolute; top: -8px; right: -8px; font-size: 8px; font-weight: 800; color: var(--violet); background: #1b1530; border: 1px solid var(--violet); border-radius: 6px; padding: 1px 4px; }
+  @keyframes pop { 0%,100%{transform:scale(1);box-shadow:0 0 10px -4px var(--violet)} 50%{transform:scale(1.07);box-shadow:0 0 22px 0 var(--violet)} }
+
   /* report view */
   #report-view { display: none; }
   #report-body {
@@ -131,6 +336,15 @@ PAGE = """<!DOCTYPE html>
   <button id="connect" onclick="toggle()">🎙️ Connect</button>
 </header>
 
+<div id="orb-stage">
+  <div id="orb-wrap" class="idle">
+    <div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div>
+    <div id="orb">🦉</div>
+    <div class="wave"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+    <div id="orb-label">not connected</div>
+  </div>
+</div>
+
 <div id="chat"><div class="hint">Hit Connect and just talk — the conversation appears here,<br>along with links to any reports Elfie writes for you.</div></div>
 <div id="composer">
   <input id="input" placeholder="…or type to Elfie" onkeydown="if(event.key==='Enter')sendText()">
@@ -139,7 +353,9 @@ PAGE = """<!DOCTYPE html>
 
 <div id="list-view">
   <div class="tabs">
-    <button class="tab active" id="tab-reports" onclick="showTab('reports')">Reports</button>
+    <button class="tab active" id="tab-home" onclick="showTab('home')">🛰️ Home</button>
+    <button class="tab" id="tab-skills" onclick="showTab('skills')">🌳 Skills</button>
+    <button class="tab" id="tab-reports" onclick="showTab('reports')">Reports</button>
     <button class="tab" id="tab-tasks" onclick="showTab('tasks')">Tasks</button>
     <button class="tab" id="tab-activity" onclick="showTab('activity')">Activity</button>
     <button class="tab" id="tab-settings" onclick="showTab('settings')">⚙️ Settings</button>
@@ -210,16 +426,76 @@ function setStatus(text, live) {
   b.className = live ? 'live' : '';
 }
 
+// ── Reactive orb ─────────────────────────────────────────────────────────────
+// State is driven by live audio: a WebAudio analyser taps the mic (listening)
+// and Elfie's track (speaking). Everything is wrapped in try/catch so a
+// WebAudio failure degrades to transcription-driven state, never breaks voice.
+let audioCtx = null, micAnalyser = null, agentAnalyser = null, thinkingUntil = 0;
+const waveBars = () => document.querySelectorAll('.wave i');
+
+function ensureCtx() {
+  if (!audioCtx) { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  return audioCtx;
+}
+function makeAnalyser(mst) {
+  try {
+    const ctx = ensureCtx(); if (!ctx || !mst) return null;
+    const src = ctx.createMediaStreamSource(new MediaStream([mst]));
+    const an = ctx.createAnalyser(); an.fftSize = 256; src.connect(an); return an;
+  } catch (e) { return null; }
+}
+function levelOf(an) {
+  if (!an) return 0;
+  const buf = new Uint8Array(an.frequencyBinCount); an.getByteTimeDomainData(buf);
+  let s = 0; for (const v of buf) { const x = (v - 128) / 128; s += x * x; }
+  return Math.sqrt(s / buf.length);
+}
+function setOrb(state, level) {
+  const w = document.getElementById('orb-wrap');
+  const orb = document.getElementById('orb');
+  const label = document.getElementById('orb-label');
+  w.className = state + (state === 'idle' ? '' : ' active');
+  const labels = { idle: 'not connected', ready: '● live — just talk', listening: 'listening…', thinking: 'thinking…', speaking: 'speaking' };
+  label.textContent = labels[state] || '';
+  const scale = 1 + Math.min(0.5, level * 2.2);
+  if (state === 'speaking' || state === 'listening') orb.style.transform = `scale(${scale.toFixed(3)})`;
+  else orb.style.transform = '';
+  const bars = waveBars();
+  if (state === 'speaking' || state === 'listening') {
+    bars.forEach((b, i) => {
+      const h = 5 + Math.abs(Math.sin(Date.now() / 90 + i)) * level * 90;
+      b.style.height = Math.min(26, h).toFixed(1) + 'px';
+    });
+  }
+}
+function orbLoop() {
+  const u = levelOf(micAnalyser), e = levelOf(agentAnalyser);
+  let state = 'idle';
+  if (!room) state = 'idle';
+  else if (e > 0.03) { state = 'speaking'; thinkingUntil = 0; }
+  else if (Date.now() < thinkingUntil) state = 'thinking';
+  else if (u > 0.045) state = 'listening';
+  else state = 'ready';
+  setOrb(state, Math.max(u, e));
+  requestAnimationFrame(orbLoop);
+}
+requestAnimationFrame(orbLoop);
+
 async function connect() {
   setStatus('connecting…', false);
+  ensureCtx();
   const { url, token } = await (await fetch('/api/token')).json();
   room = new Room();
 
   room.on(RoomEvent.TrackSubscribed, (track) => {
-    if (track.kind === 'audio') document.body.appendChild(track.attach());
+    if (track.kind === 'audio') {
+      document.body.appendChild(track.attach());
+      try { agentAnalyser = makeAnalyser(track.mediaStreamTrack); } catch (e) {}
+    }
   });
   room.on(RoomEvent.Disconnected, () => {
-    room = null;
+    room = null; micAnalyser = null; agentAnalyser = null;
     if (mode === 'wakeword') enterWaiting();   // wake word will bring her back
     else { setStatus('not connected', false); scheduleReconnect(); }
   });
@@ -231,11 +507,16 @@ async function connect() {
     const text = await reader.readAll();
     if (reader.info.attributes['lk.transcription_final'] !== 'true') return;
     const isAgent = p?.identity?.startsWith('agent');
+    if (!isAgent) thinkingUntil = Date.now() + 5000;   // user finished → she's thinking
     addMsg(isAgent ? 'Elfie 🔊' : 'You 🎙️', text, isAgent ? 'elfie' : 'you');
   });
 
   await room.connect(url, token);
   await room.localParticipant.setMicrophoneEnabled(true);
+  try {
+    const pub = [...room.localParticipant.audioTrackPublications.values()][0];
+    micAnalyser = makeAnalyser(pub?.track?.mediaStreamTrack);
+  } catch (e) {}
   setStatus('● live — just talk', true);
   localStorage.setItem('elfie-autoconnect', '1');
   reconnectAttempts = 0;
@@ -290,13 +571,14 @@ async function initConnection() {
 }
 initConnection();
 
-// ── Reports & tasks ──────────────────────────────────────────────────────────
-let tab = 'reports';
+// ── Tabs, capabilities, progress, skill tree, reports, tasks ─────────────────
+let tab = 'home';
+const TABS = ['home', 'skills', 'reports', 'tasks', 'activity', 'settings'];
+const seenFresh = {};   // capability key -> last_used we already flashed
 
 function showTab(t) {
   tab = t;
-  for (const name of ['reports', 'tasks', 'activity', 'settings'])
-    document.getElementById('tab-' + name).classList.toggle('active', t === name);
+  for (const name of TABS) document.getElementById('tab-' + name).classList.toggle('active', t === name);
   refresh();
 }
 
@@ -308,8 +590,83 @@ function timeAgo(iso) {
   return Math.floor(s / 86400) + ' d ago';
 }
 
+function renderHome(caps, prog) {
+  const list = document.getElementById('list');
+  const dgm = prog.deepgram_balance != null ? prog.deepgram_balance : null;
+  const stats = `
+    <div class="stats">
+      <div class="stat"><div class="n accent">${prog.reports}</div><div class="l">Reports written</div></div>
+      <div class="stat"><div class="n green">${prog.tasks_done}</div><div class="l">Tasks completed</div></div>
+      <div class="stat"><div class="n violet">${prog.skills_learned}</div><div class="l">Skills learned</div></div>
+      <div class="stat"><div class="n">$${prog.spent_total.toFixed(2)}</div><div class="l">Spent all-time</div></div>
+    </div>
+    <div class="card" style="cursor:default">
+      <div style="display:flex;justify-content:space-between;font-size:14px"><span>Capabilities unlocked</span><span class="meta">${prog.skills_unlocked} / ${prog.skills_total}</span></div>
+      <div class="bar"><i style="width:${Math.round(100*prog.skills_unlocked/prog.skills_total)}%"></i></div>
+      ${dgm != null ? `<div style="display:flex;justify-content:space-between;font-size:14px;margin-top:14px"><span>Deepgram credit remaining</span><span class="meta">$${dgm}</span></div>
+      <div class="bar"><i style="width:${Math.min(100,Math.round(100*dgm/200))}%;animation-delay:.15s"></i></div>` : ''}
+    </div>`;
+
+  // group the live (non-locked) capabilities for the Mission Control grid
+  const groups = {};
+  for (const c of caps) { if (c.locked) continue; (groups[c.group] = groups[c.group] || []).push(c); }
+  let grid = '';
+  for (const [g, items] of Object.entries(groups)) {
+    grid += `<div class="group-label">${g}</div><div class="cap-grid">`;
+    for (const c of items) {
+      const recent = c.last_used && (Date.now() - new Date(c.last_used)) < 30 * 60 * 1000;
+      const fresh = c.last_used && seenFresh[c.key] && seenFresh[c.key] !== c.last_used;
+      if (c.last_used) seenFresh[c.key] = c.last_used;
+      const cls = ['cap', recent ? 'on' : '', c.learned ? 'learned' : '', fresh ? 'fresh' : ''].join(' ').trim();
+      grid += `<div class="${cls}">
+        ${recent ? '<span class="dot"></span>' : ''}
+        <span class="ico">${c.icon}</span>
+        <div><div class="name">${c.name}</div><div class="desc">${c.learned ? 'learned skill' : c.desc}</div></div>
+      </div>`;
+    }
+    grid += `</div>`;
+  }
+  list.innerHTML = stats + grid;
+}
+
+function renderSkills(caps, prog) {
+  const list = document.getElementById('list');
+  const lvl = 1 + prog.skills_learned + Math.floor(prog.tasks_done / 3);
+  const tiers = { 'Core': [], 'Learned skills': [], 'Locked': [] };
+  for (const c of caps) {
+    if (c.locked) tiers['Locked'].push(c);
+    else if (c.learned) tiers['Learned skills'].push(c);
+    else tiers['Core'].push(c);
+  }
+  let html = `
+    <div class="tree-head">
+      <span class="lvl">Level ${lvl}</span>
+      <div class="xp-bar"><i style="width:${Math.round(100*prog.skills_unlocked/prog.skills_total)}%"></i></div>
+      <span class="meta">${prog.skills_unlocked} of ${prog.skills_total} abilities</span>
+    </div>`;
+  for (const [name, items] of Object.entries(tiers)) {
+    if (!items.length) continue;
+    html += `<div class="tier-label">${name === 'Locked' ? 'Not yet learned' : name}</div><div class="tier">`;
+    for (const c of items) {
+      const cls = ['tnode', c.locked ? 'locked' : 'unlocked', c.is_new ? 'newnode' : ''].join(' ').trim();
+      html += `<div class="${cls}"><span class="e">${c.icon}</span><span class="nm">${c.name}</span></div>`;
+    }
+    html += `</div>`;
+  }
+  html += `<div class="meta" style="margin-top:18px">New abilities arrive when you ask Elfie to <b>learn a skill</b> — she researches it, writes it, runs a safety check, and a fresh node lights up here.</div>`;
+  list.innerHTML = html;
+}
+
 async function refresh() {
   const list = document.getElementById('list');
+  if (tab === 'home' || tab === 'skills') {
+    const [caps, prog] = await Promise.all([
+      (await fetch('/api/capabilities')).json(),
+      (await fetch('/api/progress')).json(),
+    ]);
+    if (tab === 'home') renderHome(caps, prog); else renderSkills(caps, prog);
+    return;
+  }
   if (tab === 'activity') {
     const u = await (await fetch('/api/usage')).json();
     const dg = u.deepgram_balance_usd > 0
@@ -319,8 +676,6 @@ async function refresh() {
         <div class="title">💳 Today: $${u.today_usd.toFixed(4)} &nbsp;·&nbsp; All time: $${u.total_usd.toFixed(4)}${dg}</div>
         <div class="meta">Usage units (tokens, audio minutes) are measured; dollar figures use list prices. Groq/Cartesia exact billing lives in their consoles.</div>
       </div>`;
-
-    // Group sessions by local date; real conversations expandable, empty blips rolled up
     const byDay = {};
     for (const s of u.recent) {
       const day = new Date(s.timestamp).toLocaleDateString();
@@ -331,7 +686,6 @@ async function refresh() {
       const secs = sessions.reduce((a, s) => a + (s.duration_sec || 0), 0);
       html += `<div class="card" style="cursor:default;background:#1d212c">
         <div class="title" style="font-size:16px">${day} — $${cost.toFixed(4)} · ${Math.round(secs / 60)} min · ${sessions.length} sessions</div></div>`;
-
       const real = sessions.filter(s => (s.turns || []).some(t => t.user));
       const blips = sessions.length - real.length;
       for (const s of real) {
@@ -642,6 +996,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(_list_voices())
         elif path == "/api/usage":
             self._json(_usage_summary())
+        elif path == "/api/capabilities":
+            self._json(_capabilities())
+        elif path == "/api/progress":
+            self._json(_progress_summary())
         elif path == "/api/reports":
             self._json(reports.list_reports())
         elif path == "/api/tasks":

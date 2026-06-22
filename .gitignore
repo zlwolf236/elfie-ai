@@ -8,3 +8,10 @@ data/
 
 # downloaded on setup (deploy/fetch_models.sh)
 models/vosk-small/
+
+# agent-skill installs and local artifacts (lavish, gnhf review surfaces, etc.)
+.agents/
+.claude/
+.serena/
+.lavish/
+skills-lock.json
