@@ -72,14 +72,22 @@ def _tool_last_used() -> dict:
     """Map of tool-name -> latest ISO timestamp it was called, from the usage log."""
     out: dict = {}
     try:
-        for line in TOOL_USAGE_FILE.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                d = json.loads(line)
-                out[d["tool"]] = d["ts"]
+        text = TOOL_USAGE_FILE.read_text(encoding="utf-8")
     except FileNotFoundError:
-        pass
+        return out
     except Exception as e:
         logger.warning(f"Tool-usage read failed: {e}")
+        return out
+    # Per-line tolerance: one corrupt/partial line (e.g. an interrupted append)
+    # must not drop the valid entries around it.
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+            out[d["tool"]] = d["ts"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
     return out
 
 
@@ -582,6 +590,15 @@ function showTab(t) {
   refresh();
 }
 
+// Escape user/data-derived text before it goes into innerHTML. Report titles,
+// task titles, learned-skill names (from filenames) and session transcripts are
+// all attacker-influenceable; without this a title like `<img onerror>` would
+// execute. URLs are linkified separately in addMsg.
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 function timeAgo(iso) {
   const s = (Date.now() - new Date(iso)) / 1000;
   if (s < 60) return 'just now';
@@ -621,7 +638,7 @@ function renderHome(caps, prog) {
       grid += `<div class="${cls}">
         ${recent ? '<span class="dot"></span>' : ''}
         <span class="ico">${c.icon}</span>
-        <div><div class="name">${c.name}</div><div class="desc">${c.learned ? 'learned skill' : c.desc}</div></div>
+        <div><div class="name">${esc(c.name)}</div><div class="desc">${esc(c.learned ? 'learned skill' : c.desc)}</div></div>
       </div>`;
     }
     grid += `</div>`;
@@ -649,7 +666,7 @@ function renderSkills(caps, prog) {
     html += `<div class="tier-label">${name === 'Locked' ? 'Not yet learned' : name}</div><div class="tier">`;
     for (const c of items) {
       const cls = ['tnode', c.locked ? 'locked' : 'unlocked', c.is_new ? 'newnode' : ''].join(' ').trim();
-      html += `<div class="${cls}"><span class="e">${c.icon}</span><span class="nm">${c.name}</span></div>`;
+      html += `<div class="${cls}"><span class="e">${c.icon}</span><span class="nm">${esc(c.name)}</span></div>`;
     }
     html += `</div>`;
   }
@@ -690,8 +707,8 @@ async function refresh() {
       const blips = sessions.length - real.length;
       for (const s of real) {
         const turns = s.turns.map(t =>
-          (t.user ? `<div class="meta" style="color:var(--accent)">You: ${t.user}</div>` : '') +
-          `<div class="meta">Elfie: ${t.elfie}</div>`).join('');
+          (t.user ? `<div class="meta" style="color:var(--accent)">You: ${esc(t.user)}</div>` : '') +
+          `<div class="meta">Elfie: ${esc(t.elfie)}</div>`).join('');
         html += `<details class="card" style="cursor:default">
           <summary style="cursor:pointer" class="title" style="font-size:16px">
             ${new Date(s.timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}
@@ -775,15 +792,15 @@ async function refresh() {
     const items = await (await fetch('/api/reports')).json();
     list.innerHTML = items.length ? items.map(r => `
       <div class="card" onclick="openReport('${r.id}')">
-        <div class="title">📄 ${r.title}</div>
-        <div class="meta">${r.source} · ${r.words} words · ${timeAgo(r.created)}</div>
+        <div class="title">📄 ${esc(r.title)}</div>
+        <div class="meta">${esc(r.source)} · ${r.words} words · ${timeAgo(r.created)}</div>
       </div>`).join('') : '<div class="empty">No reports yet — ask Elfie something technical.</div>';
   } else {
     const items = await (await fetch('/api/tasks')).json();
     list.innerHTML = items.length ? items.map(t => `
       <div class="card" ${t.report_id ? `onclick="openReport('${t.report_id}')"` : ''}>
-        <div class="title"><span class="badge ${t.status}">${t.status}</span>${t.title}</div>
-        <div class="meta">${t.kind} · started ${timeAgo(t.created)}${t.error ? ' · ' + t.error : ''}</div>
+        <div class="title"><span class="badge ${t.status}">${t.status}</span>${esc(t.title)}</div>
+        <div class="meta">${esc(t.kind)} · started ${timeAgo(t.created)}${t.error ? ' · ' + esc(t.error) : ''}</div>
       </div>`).join('') : '<div class="empty">No tasks yet — say "Elfie, can you research…"</div>';
   }
 }
@@ -942,14 +959,21 @@ def _usage_summary() -> dict:
     path = reports.REPORTS_DIR.parent / "sessions.jsonl"
     sessions = []
     try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                sessions.append(json.loads(line))
+        text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        pass
+        text = ""
+    # Per-line tolerance: a single corrupt/partial line (e.g. an interrupted
+    # append) must degrade to "skip that line", never crash the endpoint.
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            sessions.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
     today = datetime.now(timezone.utc).date().isoformat()
     return {
-        "today_usd": round(sum(s.get("cost_usd", 0) for s in sessions if s["timestamp"][:10] == today), 4),
+        "today_usd": round(sum(s.get("cost_usd", 0) for s in sessions if s.get("timestamp", "")[:10] == today), 4),
         "total_usd": round(sum(s.get("cost_usd", 0) for s in sessions), 4),
         "session_count": len(sessions),
         "deepgram_balance_usd": _deepgram_balance(),
